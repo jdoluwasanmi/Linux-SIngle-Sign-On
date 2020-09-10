@@ -1,0 +1,145 @@
+Setting up a Linux system to do single-sign-on with Active Directory.
+Here's some notes about how I made things work for myself, both to remind me in the future, and in hopes it will help you too. This was all done with a Debian Lenny system, but it should be very similar for other Linux distros. You'll need to adjust the package names appropriately, of course.
+Note: the procedure here differs somewhat from that described in Ondrej's Blog.
+
+This procedure assumes you have the cooperation of the Active Directory administrator (or are the same). If you do not, this probably won't be much help to you. It also assumes a basic level of knowledge of kerberos and ldap, or at least that you can figure things out as you go along. :)
+
+What we're going to accomplish:
+
+The machine will have a computer account in AD, with a corresponding keytab on the local host, and will periodically rotate its password.
+The machine will use Active Directory's LDAP for user account information.
+The machine will use Active Directory's Kerberos for password verification.
+You can ssh to and from other machines without being prompted, without needing either authorized_keys (on the server) or id_dsa and known_hosts files (on the client).
+The automount daemon will be getting its automount maps from Active Directory LDAP.
+In all the examples, I will assume that your domain is called EXAMPLE.COM and the host you are configuring it called testhost. Replace as appropriate.
+So, let's get on with it.
+
+1. Making sure kerberos works
+First, install the package krb5-user. Edit the file /etc/krb5.keytab so that default_realm is correct. E.g. default_realm = EXAMPLE.COM
+Okay, now, make sure it works: type kinit your-username. (I assume you have a user in the Windows domain, right?). That should prompt you for your password and give you credentials. You can check out your creds with klist.
+
+2. Installing keytab for the host
+You need to get a keytab for your machine. The Officially Recommended™ way to do this is with the tool "ktpass" on Windows. I am not going to go that route, but rather a much nicer way.
+There is a tool called "msktutil", which is able to do many useful things like creating a /etc/krb5.keytab file for a computer account in AD. (I adopted it and fixed up a bunch of bugs for you, but I did not write it originally. You want to be using version 0.4.)
+
+Anyhow, that's exactly what needs to be done now. So, go download and install it.
+
+If you do not have "Create computer objects" credentials in AD, you need to first go ask your Friendly Windows Sysadmin™ to create a computer object for you. If your computer's hostname is testhost.example.com, she will need to create a computer object named "testhost", then right click on the newly created object and select "Reset Account". That second step is necessary so that the password gets set to the default.
+
+Alternatively, if you do have the "Create computer objects" credentials in AD, you can avoid the precreate step by simply doing a kinit from a root shell before running the next command. The msktutil tool will use your user credentials if you have them.
+
+You now need to join your machine to the domain -- that is, create a keytab file. The procedure is quite trivial. As root, simply type:
+
+msktutil -c
+That will authenticate to AD with kerberos, change the machine account's password to a new random value, write out a keytab, update various attributes in LDAP, and add a host/testhost.example.com service principal for use by ssh. Whew!
+Verify that it worked by running (as root) "kinit -k 'testhost$'".
+
+msktutil has a bunch of other options, check out its manpage for more information.
+
+3. SSH with existing kerberos keys
+Okay, still with me? This part is easy, and not Active-Directory specific at all. You will be setting up your ssh server to accept kerberos tickets for incoming ssh sessions.
+Edit /etc/ssh/sshd_config, and make sure you have the following settings set like this:
+
+GSSAPIAuthentication yes
+ChallengeResponseAuthentication yes
+PasswordAuthentication no
+Restart sshd.
+
+In your ssh_config, (or ~/.ssh/config), make sure you have:
+
+GSSAPIAuthentication yes
+GSSAPIKeyExchange yes
+The only setting that's not obvious is ChallengeResponseAuthentication and PasswordAuthentication. Those are basically the same thing, except that forced-password-change prompts don't work with PasswordAuthentication.
+
+Now, you can ssh between hosts without entering a password, (assuming the hosts have local user accounts with the same names as the Active Directory accounts since we haven't set up LDAP yet...), but even better, you never need to see a "The authenticity of host 'foo (1.2.3.4)' can't be established" prompt again for hosts in your realm!
+
+There's another config option which is useful: GSSAPIDelegateCredentials. This is sort of like ssh agent forwarding: only to be enabled if you trust the other host. There's a convenient command line argument you can use to enable it, -K, or you can of course enable it for particular hosts in your ssh config.
+
+4. Login with kerberos password:
+Next up: configuring PAM to verify passwords against kerberos. Install the package libpam-krb5. Setup is quite straightforward, I basically just followed the docs in /usr/share/doc/libpam-krb5/README.gz.
+But, to reproduce the essentials...
+
+Add to the beginning of /etc/pam.d/common-account:
+
+account required        pam_krb5.so minimum_uid=500
+Add to the beginning of /etc/pam.d/common-auth:
+
+auth    sufficient      pam_krb5.so try_first_pass minimum_uid=500 expose_account
+Add to the beginning of /etc/pam.d/common-password:
+
+password   sufficient pam_krb5.so minimum_uid=500
+And add to the beginning of /etc/pam.d/common-password:
+
+session optional        pam_krb5.so minimum_uid=500
+Then, login (via ssh or GUI) verifies the password via kerberos, and furthermore, will automatically give you tickets you can use to authenticate to other services (e.g. sshd on another machine).
+
+5. Intermission -- discussion about LDAP authentication
+This is where it starts to get tricky. The next two steps, setting up NSS and autofs to use LDAP, are complicated significantly by the need to present credentials to talk to AD. Unlike many LDAP servers, the default install of AD does not allow anonymous users to query it via LDAP. This can be changed if your administrators are agreeable, but you may meet some resistance to doing so, as I have.
+Just in case they're okay with it, here's an article describing how to enable anonymous access. In addition to doing that, you'll need to actually give the user "Anonymous" access to the required objects in the LDAP db. (Note that Anonymous is not included in the Everyone group, and thus has access to basically nothing by default).
+
+But, assuming that you're not going to allow Anonymous access to your LDAP database...you'll need to present credentials to access LDAP.
+
+I ended up using LDAP simple authentication with a shared user account called "ldapsearch". It's possible (and I'll amend this document later to describe how) to use the host's kerberos keytab to authenticate, instead of a shared password. But that has complications of its own.
+
+6. Use LDAP for user information (homedir/uid/etc)
+Install the packages libnss-ldapd, nslcd, and nscd.
+Note: libnss-ldapd is not libnss-ldap; the former runs all ldap queries through a daemon, the latter runs it from each requesting process. This is an important difference, as the former can use systemwide authentication credentials (e.g. /etc/krb5.keytab or a password), without requiring all users to be able to read them. If you want to use libnss-ldap, the configuration should be similar, you just have to be okay with allowing all users to be able to read the password (and you absolutely can't use it with a keytab). It's also inherently sketchy to dynamically link in all the libraries required for ldap queries into every program calling getent (which libnss-ldap does, through being an nss plugin), so I'd recommend libnss-ldapd in any case.
+
+If your LDAP directory has users with CN of "Lastname, Firstname" (not the default in AD, but some people do that...), note that you need to be using version 0.7.2 or later of nslcd/libnss-ldapd. Versions before 0.7.2 have a bug with escaping commas in LDAP queries.
+
+nscd is the standard glibc caching daemon; it's not required, but is useful to reduce the number of ldap queries made to the servers.
+
+LDAP configuration was fairly well documented and straightforward. The file /etc/nslcd.conf needs a bunch of stuff in it saying how to connect and how to map the attributes to the right passwd fields.
+
+The AD server I'm using already had accounts for everyone with the same names as the passed file on the linux system. However, I needed to migrate over the uid/gid/homedir/shell info. I did this using this script.
+
+7. Automount maps
+This was the most pain in the ass of everything, mostly because of bugs in the autofs client, and lack of anonymous access to LDAP:
+autofs4 (the default in debian lenny) doesn't support authenticated LDAP at all, only anonymous.
+autofs5 (also available but not default on debian) has *broken* support for authenticated LDAP until very recently. The version in lenny is broken.
+So, if you want to use any form of auto at all, you need at least version 5.0.5 plus the upstream patch "autofs-5.0.5-refactor-ldap-sasl-bind.patch".
+PLUS even with that, it still couldn't do password authentication. This is due to two issues:
+Issue 1: autofs5 doesn't support LDAP simple authentication. I've created a patch to enable autofs5 to use simple authentication.
+
+Issue 2: autofs5 does support DIGEST-MD5 SASL, which Active Directory also supports. However, because of a bug in Win2k8 (with a hotfix available: KB 975697, it doesn't actually work. Sigh.
+
+Of course, if you can configure your AD server to enable anonymous access to the automount maps, both autofs4 and 5 would just worked out of the box.
+
+I also wrote a script to migrate the automount maps into the AD LDAP.
+
+8. Setting up Apache to use kerberos auth
+First, install the mod_auth_kerb module. In debian, it's in the package libapache2-mod-auth-kerb.
+You probably want to use a separate computer account for apache, since it's good practice to not expose your host keytab to non-root users (like the one apache runs as). Thus, do something like the following to create a separate keytab for the current hostname, but with a distinct account (and thus, distinct encryption key):
+
+msktutil --user-creds-only -k /etc/apache2/krb5_http.keytab -s HTTP -s HTTP/testhost \
+ --update --computer-name HTTP_testhost --dont-expire-password
+A few notes on this command:
+You need to tell it to use admin credentials for this command, because adding other hostnames to service principals is not allowed in the default permissions for the computer account itself. If you can't do that, you can add the extra service principals in the AD GUI, or use --precreate on another machine, same as creating the host's keytab.
+You can use whatever you like for the "computer-name" argument. It just has to be a unique name in your Domain.
+You should repeat the -s HTTP/some-hostname for every possible hostname that a user could type to get to your server.
+Since your server is named testhost.example.com, it's likely that users can also get to it by typing "http://testhost/" in their URL bar, since they probably have example.com as a search domain in their DNS configuration. Thus, the -s HTTP/testhost
+
+If that host also has an alias awesome-server.example.com, you'd need to additionally pass -s HTTP/awesome-server.example.com -s HTTP/awesome-server.
+
+Okay, now configure apache. For the directory you want to protect, add the following configuration:
+
+  AuthType Kerberos
+  AuthName "Kerberos Login"
+  KrbMethodK5Passwd off
+  Krb5Keytab /etc/apache2/krb5_http.keytab
+  Require valid-user
+That's it, if you just want to check if the user exists, or check for specific user-ids. If you additionally want to check if the user is in a given group, you'll need to also set up mod_ldap_authnz. (comes with apache2 in Debian.) Unfortunately, the only way that it knows how to authenticate against LDAP is anonymously or with a user/password. So no GSSAPI auth to read LDAP can be used here...But in any case, it can be setup something like this (But I haven't gotten around to testing this bit yet so YMMV!)
+
+  AuthLDAPBindDN "ldapsearch@realm"
+  AuthLDAPBindPassword ldapsearch's-password
+  AuthzLDAPAuthoritative off
+  AuthLDAPUrl "ldap://hostname-of-domain-controller?sAMAccountName"
+  Require ldap-group CN=TestGroup,OU=Groups,OU=Company
+(Sidenote: If you want to deploy single-sign-on for websites for users that may not have kerberos tickets on their client machines, I'd recommend checking out WebAuth, which is a Kerberos-based single-sign-on solution that doesn't require client-side tickets. I haven't tried it yet, but it looks promising.)
+
+9. Conclusion
+…You're done! There's nothing more to say! (hah)
+Thanks for reading. Any questions, shoot me an email...
+
+James Y. Knight --- foom@fuhm.net
+Last updated Mar 2010
